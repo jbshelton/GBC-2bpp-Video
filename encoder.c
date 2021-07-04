@@ -1,11 +1,8 @@
 /*
-GBC 2bpp encoder, version 0.0 (flattening crumpled paper from the trash stage)
-DATE: 7/2/2021
-None of this code is final, I just pulled it from a garbage untested bad idea encoder
-that I was working on like a week or two ago for a couple of hours (as opposed to dozens
-of hours I worked on GBAudioPlayerV2)
-I won't use much code from this current version in the final version of the encoder,
-but I think some of it will be useful as a very rough base.
+GBC 2bpp encoder, version 0.1 (making progress on the semi-HQ audio encoder stage)
+DATE: 7/3/2021
+Changes: more progress on semi-HQ encoder (duh), but that's pretty much it
+Will probably finish the semi-HQ encoder in version 0.2, as well as remove all code that I definitely won't be using
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,22 +12,28 @@ but I think some of it will be useful as a very rough base.
 
 #define FRAME_SIZE (160 * 120)
 #define INPUT_IMG_SIZE (FRAME_SIZE * 3)
+#define TILE_DATA_SIZE (127 * 16)
+#define FRAME_BLOCK_SIZE ((16384 - TILE_DATA_SIZE) / 13)
 
 static const double sample_rate = 9198.0;
 static const double gb_fps = sample_rate / 154.0;
 static const double gb_tpf = 1 / gb_fps; //time per frame, used for framerate interpolation
 
 static uint8_t output[1024 * 1024 * 8];
-static const size_t audio_size = 358; //this is size minus one
+static const size_t pulse_bytes = 308;
+static const size_t mv_bytes = 51;
+static const size_t total_audio_bytes = pulse_bytes + mv_bytes;
+static const size_t palette_bytes = 20;
+static const size_t scy_bytes = 120;
 
-size_t pos = 0x4000;
+size_t pos = 0x4000; //encoding will always start on offsets of 0x4000 bytes
 
 typedef struct 
 {
 	unsigned red, green, blue;
 }pixel_t;
 
-int main(int argc, const char * argv[])
+int main(int argc, const char * argv[]) //eh... I kinda lied, stole this part from GBVideoPlayer2 (only because I'm a total noob at C lol, will change for the final encoder)
 {
 	if (argc != 5) {
         printf("Usage: %s frame_rate audio_file.raw output.bin\n", argv[0]);
@@ -53,8 +56,7 @@ int main(int argc, const char * argv[])
 	prepare_quantize_table(&pulse_list, &mv_list);
 
 	//THIS CODE WILL NOT WORK WITH CURRENT PROPOSED FORMAT!
-	//The format still needs to be finalized, but it certainly isn't neat and tidy like
-	//I thought this previous encoder was going to be...
+	//The format still needs to be finalized, but it certainly isn't neat and tidy like I thought this previous encoder was going to be...
 	bool done = false;
 	uint8_t quantized_results[2];
     while (!done || pos<sizeof(output)) {
@@ -80,7 +82,7 @@ int main(int argc, const char * argv[])
     char in_filepath[1024];
     char out_filepath[1024];
     scanf("%s", out_filepath); //modify the makefile to output the directory of the output file first!
-    FILE *out_img = fopen(out_filepath, "wb"); //encodes all the images as one big ass file
+    FILE *out_img = fopen(out_filepath, "wb"); //encodes all the images as one big ass file, might change to a frame list and individual file-based method (I'll make another document for output/input files)
     while(true)
     {
     	gb_time += gb_tpf;
@@ -108,7 +110,7 @@ int main(int argc, const char * argv[])
     			fclose(in_img);
     		}
     	}
-    	if(source_tpf>gb_tpf) //if the video happens to be 30fps then this will come in handy (but bad apple is 60fps so I probably won't test this)
+    	if(source_tpf>gb_tpf) //if the video happens to be 30fps then this will come in handy (but bad apple is 60fps so I probably won't test this) (I will actually encode and submit Bad Apple for the GB Compo)
     	{
     		if(source_time-gb_time>gb_tpf)
     		{
@@ -175,12 +177,14 @@ void tileformat_image(uint8_t *input_image, uint8_t *output_tiles)
 					//fy = 15 blocks of 320 bytes
 
 					//final format: each group of 16 bytes is represented as a tile
+					//as of 7/3/2021 yeah I forget what I was going for here
 				}
 			}
 		}
 	}
 }
 
+//this will probably be thrown out
 static void prepare_quantize_table(uint8_t *pulse_list, uint8_t *mv_list) //expects lists to be 256 items large
 {	
 	int pulse = 0;
@@ -247,10 +251,128 @@ static void prepare_quantize_table(uint8_t *pulse_list, uint8_t *mv_list) //expe
 	}
 }
 
+//not sure if I'll keep this due to how the semi-HQ audio works
 void quantize(uint8_t left_sample, uint8_t right_sample, uint8_t *pulse_list, uint8_t *mv_list, uint8_t *results)
 {
 	results[0] = pulse_list[left_sample]<<4 | pulse_list[right_sample];
 	results[1] = mv_list[left_sample]<<4 | mv_list[right_sample];
+}
+
+//disclaimer: I don't know how returning an array/pointer works in C since I come from Java so this might look kinda janky
+//subject to change once I know how to get the size of arrays and return an array from a function
+void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right_sample_list, uint8_t *semi_hq_table, uint8_t *results)
+{
+	uint8_t largest_left_sample = 0;
+	uint8_t largest_right_sample = 0;
+	size_t sample_batch_size = 6;
+	if(extra_sample==true)
+	{
+		sample_batch_size = 7;
+	}
+	for(size_t i=0; i<sample_batch_size; i++)
+	{
+		if(left_sample_list[i]>127)
+		{
+			if((left_sample_list[i]-127) > largest_left_sample)
+			{
+				largest_left_sample = left_sample_list[i];
+			}
+		}
+		else
+		{
+			if((127-left_sample_list[i]) > largest_left_sample)
+			{
+				largest_left_sample = left_sample_list[i];
+			}
+		}
+		if(right_sample_list[i]>127)
+		{
+			if((right_sample_list[i]-127) > largest_right_sample)
+			{
+				largest_right_sample = right_sample_list[i];
+			}
+		}
+		else
+		{
+			if((127-right_sample_list[i]) > largest_right_sample)
+			{
+				largest_right_sample = right_sample_list[i];
+			}
+		}
+	}
+	//now to figure out what master volume to use by scanning through the MV combinations and rougly quantizing the signal ig?
+	bool last_mv_too_big = true;
+	uint8_t left_mv = 0;
+	uint8_t right_mv = 0;
+	for(uint8_t m=8; m>0; m--)
+	{
+		if(((uint8_t)((128.0/120.0)*(15.0*(double)m))-1) > largest_left_sample)
+		{
+			if(last_mv_too_big!=true)
+			{
+				left_mv = m-2;
+				break;
+			}
+			else
+			{
+				last_mv_too_big = true;
+			}
+		}
+		else
+		{
+			last_mv_too_big = false;
+		}
+	}
+	for(uint8_t m=1; m<=8; m++)
+	{
+		if(((uint8_t)((128.0/120.0)*(15.0*(double)m))-1) > largest_right_sample)
+		{
+			if(last_mv_too_big!=true)
+			{
+				right_mv = m-2;
+				break;
+			}
+			else
+			{
+				last_mv_too_big = true;
+			}
+		}
+		else
+		{
+			last_mv_too_big = false;
+		}
+	}
+	//now that the master volume range has been recorded, generate a list of equivalent amplitudes
+	//...in fact, I will generate amplitude tables for all 8 master volume configurations in main in the final version of this encoder
+	//I'm just doing it here for a reference point
+	int pulse = 0;
+	int outamp = 0;
+	int left_amplitude_table[256];
+	int right_amplitude_table[256];
+	//note for future me when I put the MV table generation in main: INITIALIZE ALL ARRAYS WITH ALL -1, MAYBE WITH MALLOC, TO MAKE SORTING WORK!
+	//also FYI I pulled most of the below algorithm code from GBAudioPlayerV2's encoder.java and made some small changes
+	for(uint8_t p=0; p<16; p++)
+	{
+		if(p<8)
+		{
+			pulse = p-8;
+			pulse = (pulse*2)+1;
+			outamp = (int)(128.0+((128.0/120.0)*((double)(pulse*(int)left_mv))));
+			left_amplitude_table[outamp] = outamp;
+			outamp = (int)(128.0+((128.0/120.0)*((double)(pulse*(int)right_mv))));
+			right_amplitude_table[outamp] = outamp;
+		}
+		else
+		{
+			pulse = p-7;
+			pulse = (pulse*2)-1;
+			outamp = (int)(127.0+((128.0/120.0)*((double)(pulse*(int)left_mv))));
+			left_amplitude_table[outamp] = outamp;
+			outamp = (int)(127.0+((128.0/120.0)*((double)(pulse*(int)right_mv))));
+			right_amplitude_table[outamp] = outamp;
+		}
+	}
+	//now that the tables have been generated, do an outside-in value spread (if the current array value is -1, replace it with the last read positive value, otherwise read the value and move on)
 }
 
 void conv_frame_to_grayscale(uint8_t *input_image, uint8_t *output_image)
@@ -270,6 +392,7 @@ void conv_frame_to_grayscale(uint8_t *input_image, uint8_t *output_image)
 	}
 }
 
+//dunno what I'm gonna do with this, might pitch the whole pixel batch thing entirely
 void conv_pix_to_grayscale(pixel_t pixel_batch, uint8_t *output_byte) //expects pixel batch to be 4 pixels large
 {
 	for(size_t i=0; i<3; i++)
@@ -280,6 +403,7 @@ void conv_pix_to_grayscale(pixel_t pixel_batch, uint8_t *output_byte) //expects 
 	output_byte |= (uint8_t)((pixel_batch[3].red + pixel_batch[3].green + pixel_batch[3].blue)/3) & 0xC0;
 }
 
+//if somebody's actually reading this, would you recommend averaging frames, ORing them, or not blending them at all and simply repeating them?
 void blend_and_repeat_frames(char in_filepath, FILE *in_frame, FILE *out_frame)
 {
 	char this_filepath = in_filepath;
@@ -306,9 +430,8 @@ void blend_and_repeat_frames(char in_filepath, FILE *in_frame, FILE *out_frame)
 	fwrite(&tiled_image, 1, OUTPUT_IMG_SIZE, out_frame);
 }
 
-//this generates tile indexes for all 300 tiles: it's sorted by ones that appear first, not by ones
-//that appear the most often
-//another function should do that, which will also generate the number of appearances for each tile
+//the only thing I MIGHT use from this is the image-to-tile format conversion
+//otherwise, I think the tile list generation from whatever I'd put here is pretty useless
 void generate_tile_list(uint8_t *input_image, uint8_t *output_data, int *tile_indexes)
 {
 	for(size_t i=0; i<300; i++)
