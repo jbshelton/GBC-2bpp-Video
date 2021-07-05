@@ -1,8 +1,9 @@
 /*
-GBC 2bpp encoder, version 0.1 (making progress on the semi-HQ audio encoder stage)
-DATE: 7/3/2021
-Changes: more progress on semi-HQ encoder (duh), but that's pretty much it
-Will probably finish the semi-HQ encoder in version 0.2, as well as remove all code that I definitely won't be using
+GBC 2bpp encoder, version 0.2
+DATE: 7/4/2021
+Changes: finished semi-HQ encoder
+Comments: encoding the audio is difficult :dead_inside:
+I still need to get to the video encoding, which is a whole different ordeal
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,19 +15,27 @@ Will probably finish the semi-HQ encoder in version 0.2, as well as remove all c
 #define INPUT_IMG_SIZE (FRAME_SIZE * 3)
 #define TILE_DATA_SIZE (127 * 16)
 #define FRAME_BLOCK_SIZE ((16384 - TILE_DATA_SIZE) / 13)
+#define AUD_VID_SIZE (32 * 15)
 
 static const double sample_rate = 9198.0;
 static const double gb_fps = sample_rate / 154.0;
 static const double gb_tpf = 1 / gb_fps; //time per frame, used for framerate interpolation
 
-static uint8_t output[1024 * 1024 * 8];
 static const size_t pulse_bytes = 308;
 static const size_t mv_bytes = 51;
 static const size_t total_audio_bytes = pulse_bytes + mv_bytes;
+static const size_t audio_offset = 20;
 static const size_t palette_bytes = 20;
 static const size_t scy_bytes = 120;
 
-size_t pos = 0x4000; //encoding will always start on offsets of 0x4000 bytes
+static uint8_t output[1024 * 1024 * 8];
+
+size_t main_pos = 0x4000 + TILE_DATA_SIZE + audio_offset; //encoding will always start on offsets of 0x4000 bytes, but audio is encoded before video
+size_t mv_pos = 0x4000 + TILE_DATA_SIZE + ((26 * 32) - 12) + 9; //master volume starts at the last 3 bytes of the first 6-byte section of the last 9 sections
+//Main audio: 25 12-byte sections, plus 8 bytes / last position: 8th byte of 26th 12-byte section (byte 828)
+//Master volume: 4 12-byte sections, plus 3 bytes / first position: 10th byte of 26th 12-byte section (byte 830)
+
+//Note for future player code: decode 24 6-sample segments, decode a 7-sample segment, decode 25 6-sample segments, then another 7-sample segment in an unrolled loop
 
 typedef struct 
 {
@@ -45,37 +54,151 @@ int main(int argc, const char * argv[]) //eh... I kinda lied, stole this part fr
 
     double source_time, gb_time, time_diff;
 
-	uint8_t pulse_list[256], mv_list[256];
-
 	FILE *audiof = fopen(argv[2], "rb"); //binary read mode (bytes)
     if (!audiof) {
         perror("Failed to load audio source file");
         return 1;
     }
 
-	prepare_quantize_table(&pulse_list, &mv_list);
-
 	//THIS CODE WILL NOT WORK WITH CURRENT PROPOSED FORMAT!
 	//The format still needs to be finalized, but it certainly isn't neat and tidy like I thought this previous encoder was going to be...
+	
+    int pulse = 0;
+	int outamp = 0;
+	int *amplitude_table;
+	amplitude_table = malloc(256*8);
+	memset(amplitude_table, -1, 256*8);
+	//also FYI I pulled most of the below algorithm code from GBAudioPlayerV2's encoder.java and made some small changes
+	for(int m=1; m<=8; m++)
+	{	
+		for(int p=0; p<16; p++)
+		{
+			if(p<8)
+			{
+				pulse = p-8;
+				pulse = (pulse*2)+1;
+				outamp = (int)(128.0+((128.0/120.0)*((double)(pulse*m))));
+				amplitude_table[outamp+(256*(m-1))] = p;
+			}
+			else
+			{
+				pulse = p-7;
+				pulse = (pulse*2)-1;
+				outamp = (int)(127.0+((128.0/120.0)*((double)(pulse*m))));
+				amplitude_table[outamp+(256*(m-1))] = p;
+			}
+		}
+	}
+	//free(left_amplitude_table);
+	//free(right_amplitude_table);
+	//now that the tables have been generated, do an outside-in value spread (if the current array value is -1, replace it with the last read positive value, otherwise read the value and move on)
+	int sample_sort = -1;
+	for(int m=1; m<=8; m++)
+	{	
+		for(int i=0; i<128; i++)
+		{
+			if(amplitude_table[i+(i*(m-1))]!=-1)
+			{
+				sample_sort = amplitude_table[i+(i*(m-1))];
+			}
+			if(sample_sort!=-1)
+			{
+				amplitude_table[i+(i*(m-1))] = sample_sort;
+			}
+		}
+		sample_sort = -1;
+		for(int i=255; i>127; i--)
+		{
+			if(amplitude_table[i+(i*(m-1))]!=-1)
+			{
+				sample_sort = amplitude_table[i+(i*(m-1))];
+			}
+			if(sample_sort!=-1)
+			{
+				amplitude_table[i+(i*(m-1))] = sample_sort;
+			}
+		}
+	}
+	//now do the process in reverse to make sure there are no -1s left in the array
+	sample_sort = -1;
+	for(int m=1; m<=8; m++)
+	{
+		for(int i=127; i>=0; i--)
+		{
+			if(amplitude_table[i+(i*(m-1))]!=-1)
+			{
+				sample_sort = amplitude_table[i+(i*(m-1))];
+			}
+			if(sample_sort!=-1)
+			{
+				amplitude_table[i+(i*(m-1))] = sample_sort;
+			}
+		}
+		sample_sort = -1;
+		for(int i=128; i<=255; i++)
+		{
+			if(amplitude_table[i+(i*(m-1))]!=-1)
+			{
+				sample_sort = amplitude_table[i+(i*(m-1))];
+			}
+			if(sample_sort!=-1)
+			{
+				amplitude_table[i+(i*(m-1))] = sample_sort;
+			}
+		}
+	}
+
 	bool done = false;
-	uint8_t quantized_results[2];
-    while (!done || pos<sizeof(output)) {
-        for (unsigned i=0; i<154; i++) {
-            uint8_t left, right;
-            if (fread(&left, 1, 1, audiof) != 1 || fread(&right, 1, 1, audiof) != 1) {
-                left = right = 0x80;
-                done = true;
+	uint8_t left_aud_batch[6];
+	uint8_t left_aud_ext_batch[7];
+	uint8_t right_aud_batch[6];
+	uint8_t right_aud_ext_batch[7];
+	uint8_t left_pulses[6];
+	uint8_t right_pulses[6];
+	uint8_t left_ext_pulses[7];
+	uint8_t right_ext_pulses[7];
+	uint8_t left_mv, right_mv;
+    while(!done || pos<sizeof(output)) 
+    {
+        //49 6-sample segments, 2 7-sample segments, per 360-byte audio section
+        //record 24 6-sample semi-HQ segments, record a 7-sample segment, then 25 6-sample segments, then another 7-sample segments
+        //check the main position and mv position with if statements to compensate for the offset-
+        //if the position isn't between 20 and 31 in the block, reset block position and increment by 1
+        for(unsigned i=0; i<24; i++) 
+        {	
+            for(unsigned r=0; r<6; r++)
+            {	
+            	if(fread(&left_aud_batch[r], 1, 1, audiof) != 1 || fread(&right_aud_batch[r], 1, 1, audiof) != 1) 
+            	{
+                	left_aud_batch[r] = right_aud_batch[r] = 0x80;
+                	done = true;
+            	}
             }
-            quantize(left, right, &pulse_list, &mv_list, &quantized_results);
-            output[pos++] = quantized_results[0];
-            output[pos++] = quantized_results[1];
+            semi_hq_encode(false, &left_aud_batch, &right_aud_batch, amplitude_table, &left_pulses, &right_pulses, &left_mv, &right_mv);
+            for(unsigned r=0; r<6; r++)
+            {
+            	output[main_pos++] = ((left_pulses[r]<<4)&0xf0)|(right_pulses[r]&0x0f);
+            }
+            output[mv_pos++] = ((left_mv<<4)&0xf0)|(right_mv&0x0f);
+            main_pos &= ~0x001f; //scratch the lower 5 bits (32 bytes)
+            main_pos += 0x1f; //increment by 32 bytes
         }
+        for(unsigned r=0; r<7; r++)
+        {
+        	if(fread(&left_aud_ext_batch[r], 1, 1, audiof) != 1 || fread(&right_aud_ext_batch[r], 1, 1, audiof) != 1) 
+            {
+               	left_aud_ext_batch[r] = right_aud_ext_batch[r] = 0x80;
+               	done = true;
+            }
+        }
+        semi_hq_encode(true, &left_aud_ext_batch, &right_aud_ext_batch, amplitude_table, &left_ext_pulses, &right_ext_pulses, &left_mv, &right_mv);
+        
         pos += (block_size - audio_size);
     }
     done = false;
     pos = 0x4000;
     fclose(audiof);
-    
+
     uint8_t input_img[INPUT_IMG_SIZE];
     uint8_t output_img[OUTPUT_IMG_SIZE];
     uint8_t out_tiled[OUTPUT_IMG_SIZE];
@@ -149,7 +272,7 @@ int main(int argc, const char * argv[]) //eh... I kinda lied, stole this part fr
     FILE *tile_source = fopen(out_filepath, "rb");
 }
 
-void tileformat_image(uint8_t *input_image, uint8_t *output_tiles)
+void tileformat_image(uint8_t * input_image[], uint8_t * output_tiles[])
 {
 	//fy = frame y
 	//fx = frame x
@@ -184,83 +307,9 @@ void tileformat_image(uint8_t *input_image, uint8_t *output_tiles)
 	}
 }
 
-//this will probably be thrown out
-static void prepare_quantize_table(uint8_t *pulse_list, uint8_t *mv_list) //expects lists to be 256 items large
-{	
-	int pulse = 0;
-	int mv = 0;
-	uint8_t pcm_equiv = 0;
-	int is_recorded[256];
-	for(int i=0, i<256, i++)
-	{
-		is_recorded[i] = -1;
-	}
-	for(int m=0, m<8, m++)
-	{
-		for(int p=0, p<16, p++)
-		{
-			if(p<8)
-			{
-				pulse = p-8;
-			}
-			else
-			{
-				pulse = p-7;
-			}
-			if(pulse>0)
-			{
-				pcm_equiv = (uint8_t)127+(2*((pulse*(m+1))));
-			}
-			else
-			{
-				pcm_equiv = (uint8_t)128+(2*((pulse*(m+1))));
-			}
-			if(is_recorded[(int)pcm_equiv] == -1)
-			{
-				is_recorded[(int)pcm_equiv] = 0;
-				pulse_list[pcm_equiv] = (uint8_t)p;
-				mv_list[pcm_equiv] = (uint8_t)m;
-			}
-		}
-	}
-	for(unsigned i=255, i>127, i--)
-	{
-		if(is_recorded[(int)i]!=-1)
-		{
-			pulse = (int)pulse_list[i];
-			mv = (int)mv_list[i];
-		}
-		else
-		{
-			pulse_list[i] = (uint8_t)pulse;
-			mv_list[i] = (uint8_t)mv;
-		}
-	}
-	for(unsigned i=0, i<128, i++)
-	{
-		if(is_recorded[(int)i]!=-1)
-		{
-			pulse = (int)pulse_list[i];
-			mv = (int)mv_list[i];
-		}
-		else
-		{
-			pulse_list[i] = (uint8_t)pulse;
-			mv_list[i] = (uint8_t)mv;
-		}
-	}
-}
-
-//not sure if I'll keep this due to how the semi-HQ audio works
-void quantize(uint8_t left_sample, uint8_t right_sample, uint8_t *pulse_list, uint8_t *mv_list, uint8_t *results)
-{
-	results[0] = pulse_list[left_sample]<<4 | pulse_list[right_sample];
-	results[1] = mv_list[left_sample]<<4 | mv_list[right_sample];
-}
-
 //disclaimer: I don't know how returning an array/pointer works in C since I come from Java so this might look kinda janky
 //subject to change once I know how to get the size of arrays and return an array from a function
-void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right_sample_list, uint8_t *semi_hq_table, uint8_t *results)
+void semi_hq_encode(bool extra_sample, uint8_t * left_sample_list[], uint8_t * right_sample_list[], int * semi_hq_table[], uint8_t * left_results[], uint8_t * right_results[], uint8_t * left_mv_out, uint8_t * right_mv_out)
 {
 	uint8_t largest_left_sample = 0;
 	uint8_t largest_right_sample = 0;
@@ -300,7 +349,7 @@ void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right
 			}
 		}
 	}
-	//now to figure out what master volume to use by scanning through the MV combinations and rougly quantizing the signal ig?
+	//now to figure out what master volume to use by comparing the largest sample to the largest master volume multiplier values
 	bool last_mv_too_big = true;
 	uint8_t left_mv = 0;
 	uint8_t right_mv = 0;
@@ -310,7 +359,7 @@ void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right
 		{
 			if(last_mv_too_big!=true)
 			{
-				left_mv = m-2;
+				left_mv = m;
 				break;
 			}
 			else
@@ -320,16 +369,18 @@ void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right
 		}
 		else
 		{
-			last_mv_too_big = false;
+			left_mv = m-1;
+			break;
 		}
 	}
-	for(uint8_t m=1; m<=8; m++)
+	last_mv_too_big = true;
+	for(uint8_t m=8; m>0; m--)
 	{
 		if(((uint8_t)((128.0/120.0)*(15.0*(double)m))-1) > largest_right_sample)
 		{
 			if(last_mv_too_big!=true)
 			{
-				right_mv = m-2;
+				right_mv = m;
 				break;
 			}
 			else
@@ -339,40 +390,17 @@ void semi_hq_encode(bool extra_sample, uint8_t *left_sample_list, uint8_t *right
 		}
 		else
 		{
-			last_mv_too_big = false;
+			right_mv = m-1;
+			break;
 		}
 	}
-	//now that the master volume range has been recorded, generate a list of equivalent amplitudes
-	//...in fact, I will generate amplitude tables for all 8 master volume configurations in main in the final version of this encoder
-	//I'm just doing it here for a reference point
-	int pulse = 0;
-	int outamp = 0;
-	int left_amplitude_table[256];
-	int right_amplitude_table[256];
-	//note for future me when I put the MV table generation in main: INITIALIZE ALL ARRAYS WITH ALL -1, MAYBE WITH MALLOC, TO MAKE SORTING WORK!
-	//also FYI I pulled most of the below algorithm code from GBAudioPlayerV2's encoder.java and made some small changes
-	for(uint8_t p=0; p<16; p++)
-	{
-		if(p<8)
-		{
-			pulse = p-8;
-			pulse = (pulse*2)+1;
-			outamp = (int)(128.0+((128.0/120.0)*((double)(pulse*(int)left_mv))));
-			left_amplitude_table[outamp] = outamp;
-			outamp = (int)(128.0+((128.0/120.0)*((double)(pulse*(int)right_mv))));
-			right_amplitude_table[outamp] = outamp;
-		}
-		else
-		{
-			pulse = p-7;
-			pulse = (pulse*2)-1;
-			outamp = (int)(127.0+((128.0/120.0)*((double)(pulse*(int)left_mv))));
-			left_amplitude_table[outamp] = outamp;
-			outamp = (int)(127.0+((128.0/120.0)*((double)(pulse*(int)right_mv))));
-			right_amplitude_table[outamp] = outamp;
-		}
+	for(int i=0; i<sample_batch_size; i++)
+	{	
+		left_results[i] = semi_hq_table[left_sample_list[i]+(left_mv*256)];
+		right_results [i] = semi_hq_table[right_sample_list[i]+(right_mv*256)];
 	}
-	//now that the tables have been generated, do an outside-in value spread (if the current array value is -1, replace it with the last read positive value, otherwise read the value and move on)
+	left_mv_out = left_mv;
+	right_mv_out = right_mv;
 }
 
 void conv_frame_to_grayscale(uint8_t *input_image, uint8_t *output_image)

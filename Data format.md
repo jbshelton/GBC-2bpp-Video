@@ -1,18 +1,17 @@
 # Encoded data format
 Because the tile resolution is 20x15, and not a multiple of 16, I'll reference this document when writing the encoder and player to format the data on the cartridge as efficiently as possible.
 
-THIS VERSION: 7/3/2021
+THIS VERSION: 7/4/2021
 
 ---
 
 ### Tile/attribute map and audio format
 In order to transfer the tile and attribute maps to VRAM most efficiently, I have to pad the last 12 bytes of a row of tiles with some data. This data will be audio data.
 This means that the maps for a 2-frame group together take up 32x30 bytes- 960 in total. That leaves 360 bytes for the audio data. Since the 308 bytes for the audio data isn't exactly divisible by 12, and the 51 bytes of semi-HQ data isn't either, some unrolled loops/code will have to be used to decode the audio data without wasting CPU cycles on conditional jumps. Here's a better explanation/list of this format:
-- 51 6-byte sections of stereo 4-bit audio data (306 bytes,) with the last 2 bytes overflowing into the 52nd section
-- 8 6-byte sections of master volume data, with the first 3 bytes being in the section with the overflowed 4-bit data
+- 49 6-byte sections of stereo 4-bit audio data (294 bytes), plus an extra 2 sections to accomodate for 7-byte strings, with 2 bytes overflowing into the 52nd section (26 12-byte sections)
+- 8 6-byte sections of master volume data, with the first 3 bytes being in the section with the overflowed 4-bit data (4 12-byte sections)
 
 Miraculously, this brings the byte usage to 357, which is nearly 100% efficient! The remaining 3 bytes can be blank, because it can't really be used anywhere else.
-Also, another note here for audio: every 154th semi-HQ sample block should include 7 4-bit samples instead of 6, to make audio quality potentially less juttery.
 
 ---
 
