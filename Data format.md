@@ -1,7 +1,7 @@
 # Encoded data format
 Because the tile resolution is 20x15, and not a multiple of 16, I'll reference this document when writing the encoder and player to format the data on the cartridge as efficiently as possible.
 
-THIS VERSION: 7/4/2021
+THIS VERSION: 7/7/2021
 
 ---
 
@@ -11,7 +11,7 @@ This means that the maps for a 2-frame group together take up 32x30 bytes- 960 i
 - 49 6-byte sections of stereo 4-bit audio data (294 bytes), plus an extra 2 sections to accomodate for 7-byte strings, with 2 bytes overflowing into the 52nd section (26 12-byte sections)
 - 8 6-byte sections of master volume data, with the first 3 bytes being in the section with the overflowed 4-bit data (4 12-byte sections)
 
-Miraculously, this brings the byte usage to 357, which is nearly 100% efficient! The remaining 3 bytes can be blank, because it can't really be used anywhere else.
+Miraculously, this brings the byte usage to 357, which is nearly 100% efficient! The remaining 3 bytes can be blank, because it can't really be used for anything else.
 
 ---
 
