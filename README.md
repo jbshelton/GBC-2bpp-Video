@@ -2,7 +2,7 @@
 A 2 bits per pixel video encoder (with audio) for the Gameboy Color, entry for the 2021 GB Compo (as a demo.)
 I will be changing this file very often, as it will be a reference for myself for both making the encoder and the ASM player!
 
-THIS VERSION: 7/7/2021
+THIS VERSION: 7/23/2021
 
 ---
 
@@ -49,15 +49,35 @@ THIS VERSION: 7/7/2021
 ---
 
 ### Encoding process
-1. Group of 26 frames are read and converted to 2 bits per pixel grayscale
-2. Groups of 2 frames are combined into one 24-color image
-3. Horizontal lines from all COMBINED images are scanned and groups of 8 pixels are quantized to 4 colors per section, palettes are tested for each section to match the INDIVIDUAL frames, and those palettes are checked/added to a list of most used palettes PER FRAME
-4. Encoder checks/truncates/optimizes the palettes and images so that only the top 8 palettes are used PER FRAME
+NOTE on 7/23/21: the combined frames should be used as a reference first when encoding. The combinations from each tile should be recorded and compared to other sections throughout encoding to get the best optimization. Overall bias or score will also be taken for the sections- if one section has more grays than black or white, then the best replacement algorithm will pick combinations that have close enough grays to reduce the palette count. The same goes for black/white.
+1. Group of 26 frames are read and converted to 2 bits per pixel grayscale (((r+g+b)/3)&0xc0)
+2. Groups of 2 frames are combined into single 16-color images (one image is just shifted left 2 bits)
+3. The algorithm will start with a somewhat random base for tile data for the first frame in the bank, and generate tile data based on changes in shade/color from each 8 pixel section in the COMBINED frame (without a limit for attribute strings, but limiting the palettes to 8 using the algorithm noted above)
+4. The algorithm will then limit the number of attribute strings to 15 by choosing best match attribute strings and rearranging tile data (while also changing horizontal mirror to reduce tile count more, if applicable)
 5. Encoder makes sure that the number of lines that get a similar attribute string in a COMBINED image is divisible by 8 (if less than 4 over, truncate; if more than 4 over, find remaining lines that could use the same attribute string)
 6. Each COMBINED image is searched for groups of 8 lines with the same attribute/palette string, and a duplicate image is encoded with the lines in that order, along with the respective Y coordinate of the line
-7. The final SCY values are calculated using a Y scroll counter to emulate the Gameboy combined with the Y coordinates of where the correctly ordered lines are
-8. The newly-encoded image data is then read out, and the encoder optimizes the tile data and attribute strings so that all 13 combined images use a maximum of 127 tiles together
-9. If duplicate checking with the flipping attributes still doesn't reduce the tile count to 127 or less, replacement tiles that are close enough will be allocated and the affected COMBINED images will be re-encoded in a separate output image, and how close it is to the intended image will be compared with the image that did not get a second encoding pass
+7. The resulting "scrambled" image is then scanned and modified accordingly utilizing vertical mirroring and possibly more horizontal mirroring to further reduce tile count
+8. The final SCY values are calculated using a Y scroll counter to emulate the Gameboy combined with the Y coordinates of where the correctly ordered lines are
+NOTE: SCY adjusts the viewing window to the background, so to set it properly (relative to zero,) invert what Y coordinate the background needs to be at (subtract it from 255.) e.g. if line 31 is being displayed, and you want to display what's on line 63 instead, set SCY to 32. (Set it to the target line minus the current line. If the result is negative, subtract it from 255 and write that to SCY.)
+9. The newly-encoded image data is then read out, and the encoder further optimizes the tile data and attribute strings so that all 13 combined images use a maximum of 127 tiles together
+10. If duplicate checking with the flipping attributes still doesn't reduce the tile count to 127 or less, replacement tiles that are close enough will be allocated and the affected COMBINED images will be re-encoded in a separate output image, and how close it is to the intended image will be compared with the image that did not get a second encoding pass
+
+---
+
+### Encoded image format (in the encoder program)
+Initial/raw combined image format:
+- 120x20 array of uint32_t: 4 bytes for 8 pixels (tile data)
+- 120x20 array of 8 uint8_t: 4 bytes per group of 8 palettes, 2 groups per entry
+Tile data grayscale bias format: 
+- 120x20 array of uint8_t: bits 0/2 is for dark bias, bit 1/3 is for light bias (palette group 1/2)
+- 0: dark bias is towards black / light bias is towards white
+- 1: dark bias is towards dark gray / light bias is towards light gray
+Final combined image format:
+- 20x15 array of uint8_t: tile indexes for tilemap
+- 20x15 array of uint8_t: tile attribute map
+- 16x1 array of uint8_t: palette data for frame combination
+- 120x1 array of uint8_t: SCY scroll data
+- 127x16 array of uint8_t: tile data for bank
 
 ---
 
@@ -74,14 +94,16 @@ NOTE: due to heavy use of the CPU even in double speed mode, I will NOT use inte
 ---
 
 ### More to note on audio and DMA timing
-The 52 M-cycles after the 96 M-cycles reserved for hblank DMA during active video displaying will be used for changing SCY and writing to the color palettes EXCLUSIVELY, and the audio will instead be unpacked and played back during a different 52 M-cycle period during active displaying, as well as preparing DMA, since the tile data DMA during vblank will be timed to occur the 176 M-cycles after the dedicated audio and DMA prep interval.
+The 52 M-cycles after the 96 M-cycles reserved for hblank DMA during active video displaying will be used for changing SCY and writing to the color palettes EXCLUSIVELY, and the audio will instead be unpacked and played back during a different 52 M-cycle period during active (visible) displaying, as well as preparing DMA, since the tile data DMA during vblank will be timed to occur the 176 M-cycles after the dedicated audio and DMA prep interval.
 
 If you didn't catch that, normally, the first 52 M-cycles of the 80 M-cycle display interval is used to play back audio and set up DMA when necessary; the first 96 M-cycles of hblank are used to either DMA tile data to VRAM, DMA tile maps/attributes to VRAM, or just stall the CPU; and the last 52 M-cycles of hblank are used to change SCY and write to color palettes. However, during vblank on the first frame of a bank, the remaining 28 M-cycles during the display interval and 148 M-cycles of hblank are used entirely to DMA tile data to VRAM.
 
-Only 13 of the 24 unused "visible" lines are taken up for DMA transfers, so the remaining 11 lines can be used to unpack and write the color palettes, if doing so during the first few reserved hblank sections isn't possible
+Only 13 of the 24 unused "visible" lines are taken up for DMA transfers, so the remaining 11 lines can be used to unpack and write the color palettes, if doing so during the first few reserved hblank sections isn't possible.
+
+For initial timing of the audio in order to work correctly, a horizontal blanking interrupt will be used as a base. Apparently, it takes 5 M-cycles in order to start executing an interrupt, so it could be assumed that accounting for a horizontal interrupt, hblank lasts 5 M-cycles less. I will test this visually by having offscreen tiles blacked out, and having on screen be all white, and changing SCX at a specific time in order to calculate when the display interval starts. From there, I can build the audio and other subroutines around the timing.
 
 ---
 
 ### Other notes
 - I may or may not rickroll people with this when I finish it (I've already rickrolled at least one person with my semi-HQ audio encoder progress update lol)
-- Because the player doesn't have any specific monochrome decoding/decompression aspects other than the smaller palette, I may make a version that encodes 32-color video at half the framerate
+- Because the player doesn't have any specific monochrome decoding/decompression aspects other than the smaller palette, I may make a version that encodes 32-color video at half the framerate (and another last note: have red, green, and blue bias instead of grayscale bias for palette optimization)
